@@ -1,7 +1,7 @@
 # Free Render service for the Voice Agent token API.
 #
-# The LiveKit Agent Worker is deployed separately to LiveKit Cloud.
-# The React frontend is deployed as a Render Static Site.
+# The LiveKit Agent Worker is deployed separately.
+# The React frontend is deployed separately on Vercel.
 
 services:
   - type: web
@@ -10,8 +10,11 @@ services:
     plan: free
     region: oregon
     rootDir: agent
+
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn app.security.token_service:app --host 0.0.0.0 --port $PORT"
+
+    startCommand: "alembic upgrade head && uvicorn app.security.token_service:app --host 0.0.0.0 --port $PORT"
+
     healthCheckPath: /docs
 
     envVars:
