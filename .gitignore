@@ -8,3 +8,9 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+!.env.production.example
