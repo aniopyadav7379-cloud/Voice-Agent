@@ -1,0 +1,69 @@
+  1           0 LOAD_CONST               0 (0)
+              2 LOAD_CONST               1 (('annotations',))
+              4 IMPORT_NAME              0 (__future__)
+              6 IMPORT_FROM              1 (annotations)
+              8 STORE_NAME               1 (annotations)
+             10 POP_TOP
+
+  3          12 LOAD_CONST               0 (0)
+             14 LOAD_CONST               2 (None)
+             16 IMPORT_NAME              2 (asyncio)
+             18 STORE_NAME               2 (asyncio)
+
+  4          20 LOAD_CONST               0 (0)
+             22 LOAD_CONST               2 (None)
+             24 IMPORT_NAME              3 (re)
+             26 STORE_NAME               3 (re)
+
+  5          28 LOAD_CONST               0 (0)
+             30 LOAD_CONST               3 (('Any',))
+             32 IMPORT_NAME              4 (typing)
+             34 IMPORT_FROM              5 (Any)
+             36 STORE_NAME               5 (Any)
+             38 POP_TOP
+
+  7          40 LOAD_CONST               0 (0)
+             42 LOAD_CONST               4 (('MossUnavailableError',))
+             44 IMPORT_NAME              6 (app.context.moss_provider)
+             46 IMPORT_FROM              7 (MossUnavailableError)
+             48 STORE_NAME               7 (MossUnavailableError)
+             50 POP_TOP
+
+  8          52 LOAD_CONST               0 (0)
+             54 LOAD_CONST               5 (('ContextBundle',))
+             56 IMPORT_NAME              8 (app.context.types)
+             58 IMPORT_FROM              9 (ContextBundle)
+             60 STORE_NAME               9 (ContextBundle)
+             62 POP_TOP
+
+ 11          64 LOAD_NAME                3 (re)
+             66 LOAD_METHOD             10 (compile)
+
+ 12          68 LOAD_CONST               6 ('\\b(remember|history|previous|earlier|past|knowledge|document|context)\\b')
+
+ 13          70 LOAD_NAME                3 (re)
+             72 LOAD_ATTR               11 (IGNORECASE)
+
+ 11          74 CALL_METHOD              2
+             76 STORE_NAME              12 (_DEEP_KNOWLEDGE_TRIGGERS)
+
+ 16          78 LOAD_NAME                3 (re)
+             80 LOAD_METHOD             10 (compile)
+
+ 17          82 LOAD_CONST               7 ('\\b(weather|news|stock|price|current|today|latest|live)\\b')
+
+ 18          84 LOAD_NAME                3 (re)
+             86 LOAD_ATTR               11 (IGNORECASE)
+
+ 16          88 CALL_METHOD              2
+             90 STORE_NAME              13 (_LIVE_DATA_TRIGGERS)
+
+ 22          92 LOAD_BUILD_CLASS
+             94 LOAD_CONST               8 (<code object ContextOrchestrator at 0x000001EBD2A5AB80, file ".\app\context\orchestrator.py", line 22>)
+             96 LOAD_CONST               9 ('ContextOrchestrator')
+             98 MAKE_FUNCTION            0
+            100 LOAD_CONST               9 ('ContextOrchestrator')
+            102 CALL_FUNCTION            2
+            104 STORE_NAME              14 (ContextOrchestrator)
+            106 LOAD_CONST               2 (None)
+            108 RETURN_VALUE

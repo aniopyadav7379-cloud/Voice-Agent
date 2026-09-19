@@ -1,0 +1,14 @@
+livekit-agents
+livekit-plugins-google
+livekit-plugins-silero
+moss
+qdrant-client
+sentence-transformers
+pydantic
+aiohttp
+sqlalchemy
+asyncpg
+alembic
+fastapi
+pyjwt
+uvicorn

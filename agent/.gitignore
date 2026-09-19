@@ -1,0 +1,14 @@
+# Environment files -- never commit real secrets. .env.production.example
+# documents variable NAMES only and is meant to be committed.
+.env
+.env.*
+!.env.production.example
+
+.venv
+.venv-linux
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+htmlcov/
+.coverage

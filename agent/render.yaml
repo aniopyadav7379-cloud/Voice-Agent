@@ -1,0 +1,79 @@
+# Render Blueprint for the backend half of voice-agent-platform.
+#
+# Deploy: Render dashboard -> New -> Blueprint -> point at this repo (this
+# file must be at the repo root, or set "Root Directory" if it lives at
+# agent/render.yaml and the repo root is one level up).
+#
+# Every secret below is `sync: false`, which makes Render prompt for the
+# value in its dashboard instead of storing it in this file -- do not
+# replace `sync: false` with the real values from your .env; paste those
+# into the Render dashboard's environment tab instead, or they'll end up
+# committed to git.
+services:
+  # -------------------------------------------------------------------
+  # Token service -- the only HTTP surface in this project. This is what
+  # the frontend's VITE_API_BASE_URL points at.
+  # -------------------------------------------------------------------
+  - type: web
+    name: voice-agent-platform-token-service
+    runtime: python
+    plan: starter
+    region: oregon
+    rootDir: agent
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn app.security.token_service:app --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /docs
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: ENVIRONMENT
+        value: development # see note in the deployment guide before flipping this
+      - key: DATABASE_URL
+        sync: false # postgresql+asyncpg://...?ssl=require -- see guide, NOT the raw psycopg-style URL
+      - key: JWT_SECRET
+        sync: false
+      - key: JWT_ISSUER
+        value: voice-agent-platform
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false # e.g. https://your-app.vercel.app -- fill in AFTER the Vercel deploy exists
+
+  # -------------------------------------------------------------------
+  # Agent worker -- long-lived LiveKit Agents process, no inbound port.
+  # Needs the heavier ML/context stack (sentence-transformers, moss,
+  # qdrant-client) that the token service doesn't.
+  # -------------------------------------------------------------------
+  - type: worker
+    name: voice-agent-platform-agent-worker
+    runtime: python
+    plan: standard # sentence-transformers pulls in torch; starter's RAM is tight for this
+    region: oregon
+    rootDir: agent
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python -m app.agent_entrypoint start"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: DATABASE_URL
+        sync: false
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: MOSS_PROJECT_ID
+        sync: false
+      - key: MOSS_PROJECT_KEY
+        sync: false
+      - key: SARVAM_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false # required by the Gemini LLM plugin -- missing from the .env this was built from
+      - key: GEMINI_MODEL
+        value: gemini-2.0-flash
+      - key: QDRANT_LOCATION
+        value: ":memory:" # fine for a single worker instance; see guide for why this doesn't scale past one
