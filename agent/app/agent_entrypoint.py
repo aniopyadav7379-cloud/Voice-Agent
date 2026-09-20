@@ -31,6 +31,10 @@ import logging
 import os
 import uuid
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession, JobContext, RunContext
 from livekit.agents.llm import ChatMessage
