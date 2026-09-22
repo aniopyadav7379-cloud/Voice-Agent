@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+﻿import { useCallback, useRef, useState } from "react";
 import {
   ConnectionState,
   DisconnectReason,
@@ -91,6 +91,34 @@ export function useLiveKit() {
         }
       });
 
+      room.on(RoomEvent.TrackSubscribed, (track, _publication, participant) => {
+        if (track.kind !== Track.Kind.Audio || participant.isLocal) return;
+
+        const element = track.attach();
+        element.autoplay = true;
+        element.setAttribute("playsinline", "true");
+        element.volume = 1;
+        element.dataset.livekitAgentAudio = "true";
+        document.body.appendChild(element);
+
+        void element.play().catch((err: unknown) => {
+          pushError(
+            "Audio playback blocked",
+            err instanceof Error
+              ? err.message
+              : "Click the page and reconnect to enable audio.",
+          );
+        });
+      });
+
+      room.on(RoomEvent.TrackUnsubscribed, (track, _publication, participant) => {
+        if (track.kind !== Track.Kind.Audio || participant.isLocal) return;
+
+        for (const element of track.detach()) {
+          element.remove();
+        }
+      });
+
       room.on(RoomEvent.MediaDevicesError, (error: Error) => {
         pushError("Microphone error", error.message || "Could not access the microphone.");
         setMicPhase("stopped");
@@ -172,6 +200,16 @@ export function useLiveKit() {
       try {
         await room.connect(livekitUrl, livekitToken);
         try {
+          await room.startAudio();
+        } catch (audioErr) {
+          pushError(
+            "Audio playback needs permission",
+            audioErr instanceof Error
+              ? audioErr.message
+              : "Click the page and reconnect to enable audio.",
+          );
+        }
+        try {
           setMicPhase("starting");
           await room.localParticipant.setMicrophoneEnabled(true);
           setMicPhase("started");
@@ -184,7 +222,10 @@ export function useLiveKit() {
         }
       } catch (err) {
         setConnectionPhase("error");
-        pushError("Connection failed", err instanceof Error ? err.message : "Could not connect to LiveKit.");
+        pushError(
+          "Connection failed",
+          err instanceof Error ? err.message : "Could not connect to LiveKit.",
+        );
         roomRef.current = null;
       }
     },
