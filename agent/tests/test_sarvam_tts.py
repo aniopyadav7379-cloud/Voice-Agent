@@ -1,13 +1,27 @@
 """
 Unit tests for the Sarvam TTS plugin. Mocks the HTTP/WS boundary only.
+
+The streaming tests below drive `SynthesizeStream` against a fake of the
+real `sarvamai` SDK socket client (`AsyncTextToSpeechStreamingSocketClient`),
+not a hand-rolled `aiohttp` WebSocket -- `tts.py`'s streaming path now uses
+Sarvam's official SDK directly (`AsyncSarvamAI().text_to_speech_streaming
+.connect(...)`), confirmed against the real installed `sarvamai` package
+(`inspect`/reading `sarvamai/text_to_speech_streaming/socket_client.py`),
+so these mock the SDK's `AudioOutput` / `ErrorResponse` / `EventResponse`
+response types rather than raw JSON-over-WS frames.
 """
 import asyncio
 import base64
 import json
 from unittest.mock import AsyncMock, MagicMock
+from contextlib import asynccontextmanager
 
 import pytest
-from livekit.agents import APIStatusError, DEFAULT_API_CONNECT_OPTIONS
+from livekit.agents import APIStatusError, APIConnectionError, DEFAULT_API_CONNECT_OPTIONS
+from sarvamai import AudioOutput, ErrorResponse, EventResponse
+from sarvamai.types.audio_output_data import AudioOutputData
+from sarvamai.types.error_response_data import ErrorResponseData
+from sarvamai.types.event_response_data import EventResponseData
 
 from app.voice_providers.sarvam.tts import TTS
 
@@ -107,76 +121,90 @@ async def test_chunked_stream_applies_digit_spelling():
     assert "पैंसठ" in sent_text or "pachaas" not in sent_text  # hi table: 65 = पैंसठ
 
 
-class _FakeWSMessage:
-    def __init__(self, data: dict):
-        import aiohttp
-        self.type = aiohttp.WSMsgType.TEXT
-        self.data = json.dumps(data)
+class _FakeSocketClient:
+    """Fake of `sarvamai`'s `AsyncTextToSpeechStreamingSocketClient` --
+    the real object `client.text_to_speech_streaming.connect(...)` yields
+    as an async context manager. Supports `configure`/`convert`/`flush`
+    and async iteration over a fixed queue of typed SDK response objects
+    (`AudioOutput` / `ErrorResponse` / `EventResponse`).
 
+    Message delivery is gated on the causal event that would actually
+    unlock it on a real server: an `AudioOutput`/`ErrorResponse` waits for
+    at least one `convert()` call, and an `EventResponse` (the 'final'
+    event) waits for at least one `flush()` call. A real Sarvam server
+    can't emit audio before receiving text, or signal 'final' before its
+    buffer was flushed — a fake that ignores that and yields immediately
+    creates an artificial race between the receive loop and
+    `asyncio.create_task(sender())` that a real network round-trip never
+    would (this is the same class of test-realism bug the original
+    version of this fake, against the old hand-rolled WS client, already
+    had to guard against)."""
 
-class _FakeStreamingWS:
-    """Minimal fake of aiohttp.ClientWebSocketResponse sufficient to drive
-    SynthesizeStream._run(): supports send_str, close, and async iteration
-    over a fixed sequence of server messages.
-
-    Deliberately waits for at least one "text" message to have been sent
-    before yielding any queued server message — a real Sarvam server can't
-    respond with audio before receiving text to synthesize, so a fake that
-    yields messages immediately (regardless of whether the client has sent
-    anything yet) creates an artificial race that wouldn't occur against
-    a real WS. This caused a real test failure on the first attempt (see
-    STATUS_REPORT.md) that turned out to be a test-realism bug, not a
-    production bug: `asyncio.create_task(sender())` doesn't guarantee the
-    sender runs before the receive loop's first iteration, and a
-    same-tick fake WS exposed that where a real network round-trip never
-    would. Fixed here by making the fake wait for real causality instead
-    of adding an artificial delay or asserting less."""
-
-    def __init__(self, messages: list[dict]):
+    def __init__(self, messages: list):
         self._messages = messages
-        self.sent: list[str] = []
-        self.closed = False
-        self._text_sent = asyncio.Event()
+        self.configure = AsyncMock()
+        self.sent_text: list[str] = []
+        self.flush_calls = 0
+        self._got_text = asyncio.Event()
+        self._got_flush = asyncio.Event()
 
-    async def send_str(self, data: str) -> None:
-        self.sent.append(data)
-        if json.loads(data).get("type") == "text":
-            self._text_sent.set()
+    async def convert(self, text: str) -> None:
+        self.sent_text.append(text)
+        self._got_text.set()
 
-    async def close(self) -> None:
-        self.closed = True
+    async def flush(self) -> None:
+        self.flush_calls += 1
+        self._got_flush.set()
 
     def __aiter__(self):
         self._iter = iter(self._messages)
         return self
 
     async def __anext__(self):
-        await self._text_sent.wait()
         try:
-            return _FakeWSMessage(next(self._iter))
+            message = next(self._iter)
         except StopIteration:
             raise StopAsyncIteration
+        if isinstance(message, EventResponse):
+            await self._got_flush.wait()
+        else:
+            await self._got_text.wait()
+        return message
+
+
+def _fake_streaming_client(ws: "_FakeSocketClient"):
+    """Fake of `AsyncSarvamAI` exposing just the
+    `.text_to_speech_streaming.connect(...)` async-context-manager surface
+    `tts.py` actually calls, wired in via `TTS._ensure_streaming_client`'s
+    `self._streaming_client` override (see below) instead of the real
+    SDK's HTTP/WS boundary."""
+
+    @asynccontextmanager
+    async def connect(**kwargs):
+        yield ws
+
+    client = MagicMock()
+    client.text_to_speech_streaming.connect = connect
+    return client
 
 
 @pytest.mark.asyncio
 async def test_synthesize_stream_pushes_audio_and_ends_on_final_event():
     """Drives the real SynthesizeStream through its public interface
-    (push_text/flush/end_input + async iteration), mocking only the WS
-    connection. Confirms: config message sent first, text message sent
-    with digit-spelling applied, audio chunks decoded and yielded as real
-    SynthesizedAudio frames, and the stream terminates cleanly on the
-    server's 'final' event rather than hanging or erroring."""
+    (push_text/flush/end_input + async iteration), mocking only the SDK's
+    WS socket client. Confirms: config sent with the right language and a
+    sample rate matching the emitter, text sent with digit-spelling
+    applied, audio chunks decoded and yielded as real SynthesizedAudio
+    frames, and the stream terminates cleanly on the server's 'final'
+    event rather than hanging or erroring."""
     audio_b64 = base64.b64encode(b"\x00\x01\x02\x03").decode("ascii")
-    fake_ws = _FakeStreamingWS(messages=[
-        {"type": "audio", "data": {"audio": audio_b64}},
-        {"type": "event", "data": {"event_type": "final"}},
+    fake_ws = _FakeSocketClient(messages=[
+        AudioOutput(data=AudioOutputData(content_type="audio/pcm", audio=audio_b64)),
+        EventResponse(data=EventResponseData(event_type="final")),
     ])
 
-    session = MagicMock()
-    session.ws_connect = AsyncMock(return_value=fake_ws)
-
     tts_client = TTS(api_key="fake-key", target_language="hi", sample_rate=16000)
-    tts_client._ensure_session = lambda: session
+    tts_client._streaming_client = _fake_streaming_client(fake_ws)
 
     stream = tts_client.stream(conn_options=DEFAULT_API_CONNECT_OPTIONS)
     stream.push_text("65 rupees")
@@ -193,36 +221,130 @@ async def test_synthesize_stream_pushes_audio_and_ends_on_final_event():
     combined = b"".join(f.frame.data.tobytes() for f in frames)
     assert b"\x00\x01\x02\x03" in combined, "decoded audio bytes from the WS message never reached the output"
 
-    # Config message must be sent before any text.
-    assert fake_ws.sent, "no messages were sent over the WS at all"
-    first_msg = json.loads(fake_ws.sent[0])
-    assert first_msg["type"] == "config"
-    assert first_msg["data"]["target_language_code"] == "hi"
+    # Config must carry the right language and match the emitter's sample
+    # rate (regression check for the silent 22050-vs-16000 mismatch bug).
+    fake_ws.configure.assert_awaited_once()
+    config_kwargs = fake_ws.configure.await_args.kwargs
+    assert config_kwargs["target_language_code"] == "hi"
+    assert config_kwargs["speech_sample_rate"] == 16000
 
     # Digit-spelling must have been applied to the text actually sent.
-    text_msgs = [json.loads(m) for m in fake_ws.sent if json.loads(m).get("type") == "text"]
-    assert text_msgs, "no text message was ever sent to Sarvam"
-    assert text_msgs[0]["data"]["text"] != "65 rupees", "digits should have been spelled, not sent raw"
+    assert fake_ws.sent_text, "no text was ever sent to Sarvam"
+    assert fake_ws.sent_text[0] != "65 rupees", "digits should have been spelled, not sent raw"
 
-    assert fake_ws.closed, "WS connection was not closed after the stream ended"
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_flushes_trailing_text_without_explicit_flush():
+    """Regression test for the actual production bug: a short reply sent
+    as a single chunk, with end_input() closing the channel directly and
+    no explicit stream.flush() first (exactly what a short LLM greeting
+    like "Hi there! How can I assist you today?" does upstream). Before
+    the fix this text could sit unflushed in Sarvam's server-side buffer
+    forever, and the base tts.py would report it as "no audio frames were
+    pushed" with the real cause gone."""
+    audio_b64 = base64.b64encode(b"\x01\x02\x03\x04").decode("ascii")
+    fake_ws = _FakeSocketClient(messages=[
+        AudioOutput(data=AudioOutputData(content_type="audio/pcm", audio=audio_b64)),
+        EventResponse(data=EventResponseData(event_type="final")),
+    ])
+
+    tts_client = TTS(api_key="fake-key")
+    tts_client._streaming_client = _fake_streaming_client(fake_ws)
+
+    stream = tts_client.stream(conn_options=DEFAULT_API_CONNECT_OPTIONS)
+    stream.push_text("Hi there! How can I assist you today?")
+    stream.end_input()  # deliberately no stream.flush() before this
+
+    frames = [f async for f in stream]
+    await stream.aclose()
+
+    assert frames, "expected audio frames for a short, unflushed reply"
+    assert fake_ws.flush_calls >= 1, "sender() must still flush the trailing buffered text"
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_skips_punctuation_only_chunks():
+    """Regression test for the actual production bug, confirmed against a
+    real run's debug log: LiveKit's LLM->TTS streaming can hand `sender()`
+    a trailing chunk that's pure punctuation (a lone "."). That chunk is
+    non-empty, so the old `if tts_text.strip():` check let it through to
+    `ws.convert()` -- and Sarvam legitimately rejects a message with zero
+    letters/digits in it with "Text must contain at least one character
+    from the allowed languages" (422), which then killed the entire
+    response even though every earlier chunk was fine. Confirmed via a
+    standalone script against the real Sarvam API that the exact
+    model/speaker/language combo this project uses works perfectly --
+    this was never a config problem, only ever this chunk-filtering one."""
+    audio_b64 = base64.b64encode(b"\x0a\x0b\x0c\x0d").decode("ascii")
+    fake_ws = _FakeSocketClient(messages=[
+        AudioOutput(data=AudioOutputData(content_type="audio/pcm", audio=audio_b64)),
+        EventResponse(data=EventResponseData(event_type="final")),
+    ])
+
+    tts_client = TTS(api_key="fake-key")
+    tts_client._streaming_client = _fake_streaming_client(fake_ws)
+
+    stream = tts_client.stream(conn_options=DEFAULT_API_CONNECT_OPTIONS)
+    # Same shape as the real debug log: two chunks of real content, then a
+    # bare trailing period as its own separate push_text() call.
+    stream.push_text("Hello! How can I help you today? Please let")
+    stream.push_text(" me know what task, ticket, worker dispatch, or information you need assistance with")
+    stream.push_text(".")
+    stream.end_input()
+
+    frames = [f async for f in stream]
+    await stream.aclose()
+
+    assert frames, "expected audio frames despite the trailing punctuation-only chunk"
+    assert "." not in fake_ws.sent_text, "a punctuation-only chunk must never be sent to Sarvam"
+    assert all(any(ch.isalnum() for ch in t) for t in fake_ws.sent_text), (
+        f"every chunk actually sent must contain at least one letter/digit, got {fake_ws.sent_text!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_raises_on_error_response():
+    """The bug: a server-side ErrorResponse was silently ignored by the
+    receive loop, the connection then closed on its own, and no audio was
+    ever pushed — masked by the base SDK as a generic 'no audio frames
+    were pushed' error with Sarvam's actual error message/code lost. Must
+    now raise APIStatusError carrying that real message and code."""
+    fake_ws = _FakeSocketClient(messages=[
+        ErrorResponse(data=ErrorResponseData(message="invalid speaker for model", code=422)),
+    ])
+
+    tts_client = TTS(api_key="fake-key")
+    tts_client._streaming_client = _fake_streaming_client(fake_ws)
+
+    stream = tts_client.stream(conn_options=DEFAULT_API_CONNECT_OPTIONS)
+    stream.push_text("hello")
+    stream.end_input()
+
+    with pytest.raises(APIStatusError) as excinfo:
+        async for _ in stream:
+            pass
+    assert "invalid speaker" in excinfo.value.message
+    assert excinfo.value.status_code == 422
+
+    await stream.aclose()
 
 
 @pytest.mark.asyncio
 async def test_synthesize_stream_ws_connect_failure_raises_not_hangs():
-    """If the streaming WS can't connect at all, this must raise a
-    structured error promptly — not hang, and not silently yield zero
-    audio as if synthesis had quietly succeeded."""
-    from livekit.agents import APIConnectionError
+    """If the streaming connection can't be established at all, this must
+    raise a structured error promptly — not hang, and not silently yield
+    zero audio as if synthesis had quietly succeeded."""
 
-    session = MagicMock()
-
-    async def _raise(*a, **kw):
+    @asynccontextmanager
+    async def _raise(**kwargs):
         raise ConnectionError("simulated connect failure")
+        yield  # pragma: no cover - unreachable, makes this a generator
 
-    session.ws_connect = _raise
+    client = MagicMock()
+    client.text_to_speech_streaming.connect = _raise
 
     tts_client = TTS(api_key="fake-key")
-    tts_client._ensure_session = lambda: session
+    tts_client._streaming_client = client
 
     stream = tts_client.stream(conn_options=DEFAULT_API_CONNECT_OPTIONS)
     stream.push_text("hello")

@@ -1,37 +1,62 @@
 """
 Sarvam TTS as a real LiveKit `tts.TTS` plugin.
 
-PORTED from Voice-AI-Agent-master's `SarvamTTSService` (batch HTTP,
-`app.text-to-speech`) and `SarvamTTSStreamingService` (per-turn WebSocket,
-`api.sarvam.ai/text-to-speech/ws`). Digit-spelling (`spell_digits`, ported
-verbatim as `app/context/num_to_words.py`) is applied before every synthesis
-call, batch or streaming — Sarvam's own documented behavior is to mis-speak
-or drop bare digits, especially Devanagari numerals, and the source's fix
-for that is preserved exactly rather than dropped as "cosmetic."
+Streaming path uses Sarvam's official `sarvamai` SDK
+(`AsyncSarvamAI().text_to_speech_streaming.connect(...)`) rather than a
+hand-rolled WebSocket client -- confirmed against the real installed SDK
+(`sarvamai.text_to_speech_streaming.socket_client`), not just its docs.
 
-VERIFICATION STATUS:
-- SDK/API verified: livekit.agents.tts base classes (TTS, ChunkedStream,
-  SynthesizeStream, AudioEmitter, TTSCapabilities) inspected via
-  `inspect.signature`/`inspect.getsource` against the real installed
-  `livekit-agents` package; Deepgram's real plugin read as the reference
-  pattern for `output_emitter` usage (`initialize`/`start_segment`/`push`/
-  `end_segment`/`flush`).
-- Adapter tested locally: unit tests (tests/test_sarvam_tts.py) mock the
-  HTTP/WS boundary and verify request shape, digit-spelling application,
-  and empty/failed-response handling (never fabricates audio bytes on
-  failure).
-- Live Sarvam call tested: NOT DONE — same constraint as the STT plugin
-  (see its module docstring). Correct against the real protocol, not yet
-  run against the real service.
+FIXED (previously silent "no audio frames were pushed" failure):
+1. The socket's `TextToSpeechStreamingSocketClientResponse` union is
+   `AudioOutput | ErrorResponse | EventResponse`, but the receive loop
+   only ever checked for the first and last of those. A server-side
+   `ErrorResponse` (bad config, invalid text, etc.) was silently dropped,
+   the loop then ran out on connection close, and the base `tts.py`
+   surfaced that as a generic "no audio frames were pushed for text: ..."
+   with the real reason gone. Now raises `APIStatusError` with Sarvam's
+   own error message/code.
+2. `ws.configure()` was never given `speech_sample_rate`, so it silently
+   used the SDK's own default (22050 Hz) while `output_emitter.initialize`
+   declared `self._tts.sample_rate` (24000 Hz by default here) -- a real
+   sample-rate mismatch between what we told LiveKit to expect and what
+   Sarvam actually sent. Now explicit and kept in sync with the emitter.
+3. `min_buffer_size` defaults to 50 chars (left at the SDK's default --
+   see the inline comment in `_run` for why a lowered value was tried
+   and reverted), so a short reply (a greeting under 50 characters, for
+   example) could sit in Sarvam's server-side buffer unless a `flush`
+   happened to land after it. The `sender()` coroutine only forwarded a
+   `flush` when the LiveKit input channel handed us an explicit flush
+   sentinel -- if the last chunk of text closed the channel without one,
+   nothing ever told Sarvam to drain the remainder. Now the `sender()`
+   coroutine unconditionally flushes once more right after the input
+   channel is exhausted, so the trailing buffered text is always
+   processed regardless of what the caller sent.
+4. `sender()` only skipped a chunk from LiveKit's LLM->TTS streaming if it
+   was empty after `.strip()`. Confirmed against a real production run
+   that the streaming tokenizer can hand us a trailing chunk that's pure
+   punctuation (a lone "."), which is non-empty and sailed through that
+   check straight to `ws.convert()`. A message with zero letters/digits
+   in it is exactly what Sarvam's "Text must contain at least one
+   character from the allowed languages" (422) means, and it fired on
+   effectively every real response. Now skips any chunk with no
+   alphanumeric character at all -- punctuation-only chunks were never
+   audibly rendered anyway, so nothing is lost by not sending them.
+
+Batch path (ChunkedStream) is unchanged -- it was never the one failing.
+
+Digit-spelling (`spell_digits`, `app/context/num_to_words.py`) is applied
+before every synthesis call, batch or streaming -- Sarvam's own documented
+behavior is to mis-speak or drop bare digits, especially Devanagari
+numerals, and that fix is preserved exactly.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
-import json
-from urllib.parse import urlencode
+import contextlib
 
 import aiohttp
+from sarvamai import AsyncSarvamAI, AudioOutput, ErrorResponse, EventResponse
 
 from livekit.agents import (
     APIConnectionError,
@@ -46,7 +71,6 @@ from livekit.agents import (
 from app.context.num_to_words import spell_digits
 
 SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
-SARVAM_TTS_WS = "wss://api.sarvam.ai/text-to-speech/ws"
 TTS_CHAR_LIMIT = 450
 NUM_CHANNELS = 1
 
@@ -57,8 +81,8 @@ def _truncate(text: str) -> str:
 
 class TTS(tts.TTS):
     def __init__(
-        self, *, api_key: str, model: str = "bulbul:v2", speaker: str = "anushka",
-        target_language: str = "en-IN", sample_rate: int = 22050,
+        self, *, api_key: str, model: str = "bulbul:v3", speaker: str = "shubh",
+        target_language: str = "en-IN", sample_rate: int = 24000,
     ):
         super().__init__(
             capabilities=tts.TTSCapabilities(streaming=True),
@@ -70,6 +94,17 @@ class TTS(tts.TTS):
         self._speaker = speaker
         self._language = target_language
         self._session: aiohttp.ClientSession | None = None
+        # Lazily-created, reused across SynthesizeStream instances (one per
+        # TTS turn) rather than a brand-new AsyncSarvamAI per turn -- same
+        # "one session, many calls" pattern as `_ensure_session` above.
+        # Overridable per-instance in tests (see tests/test_sarvam_tts.py)
+        # without needing a real API key or network access.
+        self._streaming_client: AsyncSarvamAI | None = None
+
+    def _ensure_streaming_client(self) -> AsyncSarvamAI:
+        if self._streaming_client is None:
+            self._streaming_client = AsyncSarvamAI(api_subscription_key=self._api_key)
+        return self._streaming_client
 
     def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None:
@@ -77,10 +112,8 @@ class TTS(tts.TTS):
         return self._session
 
     def update_language(self, language: str) -> None:
-        """Called by the agent when LID (romanized_lid.py or Sarvam's own
-        detection) determines the conversation's active language has
-        changed — same 'Feature 7' behavior as the source's
-        LanguageDetectedFrame handling."""
+        """Called by the agent when LID determines the conversation's active
+        language has changed."""
         self._language = language
 
     def synthesize(
@@ -96,7 +129,7 @@ class TTS(tts.TTS):
 
 
 class ChunkedStream(tts.ChunkedStream):
-    """Batch path — ported from SarvamTTSService._call_tts_api."""
+    """Batch path -- unchanged, raw HTTP call to the non-streaming endpoint."""
 
     def __init__(self, *, tts: TTS, input_text: str, conn_options: APIConnectOptions):
         super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
@@ -120,7 +153,7 @@ class ChunkedStream(tts.ChunkedStream):
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
-                    raise APIStatusError(message=body[:200], status_code=resp.status, request_id=None, body=None)
+                    raise APIStatusError(message=body[:800], status_code=resp.status, request_id=None, body=None)
                 resp_json = await resp.json()
 
         except asyncio.TimeoutError as e:
@@ -132,8 +165,6 @@ class ChunkedStream(tts.ChunkedStream):
 
         audios_b64 = [a for a in (resp_json.get("audios") or []) if a]
         if not audios_b64:
-            # Never fabricate audio — an empty/failed response yields no
-            # audio output at all, not silent fake bytes.
             raise APIStatusError(message="Sarvam TTS returned no audio", status_code=200, request_id=None, body=None)
 
         output_emitter.initialize(
@@ -146,9 +177,8 @@ class ChunkedStream(tts.ChunkedStream):
 
 
 class SynthesizeStream(tts.SynthesizeStream):
-    """Streaming path — ported from SarvamTTSStreamingService. One WS
-    connection per stream lifetime (matching the source's own per-turn
-    connection design, not a simplification of it)."""
+    """Streaming path -- uses Sarvam's official SDK (AsyncSarvamAI), not a
+    hand-rolled WebSocket client. One connection per stream lifetime."""
 
     def __init__(self, *, tts: TTS, conn_options: APIConnectOptions):
         super().__init__(tts=tts, conn_options=conn_options)
@@ -162,55 +192,101 @@ class SynthesizeStream(tts.SynthesizeStream):
         segment_id = utils.shortuuid()
         output_emitter.start_segment(segment_id=segment_id)
 
-        url = f"{SARVAM_TTS_WS}?{urlencode({'model': self._tts._model, 'send_completion_event': 'true'})}"
+        client = self._tts._ensure_streaming_client()
 
         try:
-            session = self._tts._ensure_session()
-            ws = await session.ws_connect(url, headers={"Api-Subscription-Key": self._tts._api_key})
-        except Exception as e:
-            raise APIConnectionError() from e
+            async with client.text_to_speech_streaming.connect(
+                model=self._tts._model, send_completion_event=True,
+            ) as ws:
+                await ws.configure(
+                    target_language_code=self._tts._language,
+                    speaker=self._tts._speaker,
+                    output_audio_codec="linear16",
+                    # Must match what output_emitter.initialize() declared
+                    # above -- otherwise Sarvam renders at its own default
+                    # (22050 Hz) while we tell LiveKit to expect
+                    # self._tts.sample_rate, corrupting playback speed/pitch.
+                    speech_sample_rate=self._tts.sample_rate,
+                    # Deliberately NOT overriding min_buffer_size here. The
+                    # SDK's docstring gives it no documented valid range,
+                    # and Sarvam's server rejected a lowered value (10)
+                    # with a generic 422 ("Input parameters has to be a
+                    # valid dictionary") -- an undocumented server-side
+                    # floor, not a client-side schema error (the payload
+                    # itself is well-formed; verified by hand against
+                    # ConfigureConnectionData). Left at the SDK's own
+                    # default (50, known-good) rather than guessing at
+                    # a number Sarvam hasn't documented as valid. The
+                    # unconditional flush after the input channel closes
+                    # (below) is what actually fixes short replies getting
+                    # stranded below that threshold -- it doesn't depend
+                    # on min_buffer_size being lowered.
+                )
 
-        async def sender() -> None:
-            async for data in self._input_ch:
-                if isinstance(data, str):
-                    spoken = spell_digits(data, self._tts._language)
-                    tts_text = _truncate(spoken)
-                    if tts_text.strip():
-                        await ws.send_str(json.dumps({"type": "text", "data": {"text": tts_text}}))
-                else:  # flush sentinel
-                    await ws.send_str(json.dumps({"type": "flush"}))
+                async def sender() -> None:
+                    async for data in self._input_ch:
+                        if isinstance(data, str):
+                            spoken = spell_digits(data, self._tts._language)
+                            tts_text = _truncate(spoken)
+                            # `.strip()` only catches whitespace-only chunks.
+                            # LiveKit's LLM->TTS streaming can (and does --
+                            # confirmed against a real production run) hand
+                            # us a trailing chunk that's pure punctuation,
+                            # e.g. a lone ".". That's non-empty, so the old
+                            # `if tts_text.strip():` check let it through --
+                            # and Sarvam legitimately rejects a message with
+                            # zero letters/digits in it with "Text must
+                            # contain at least one character from the
+                            # allowed languages". Skipping it here changes
+                            # nothing about the spoken output (punctuation
+                            # on its own isn't vocalized anyway), it just
+                            # stops sending Sarvam a message it will always
+                            # reject.
+                            if any(ch.isalnum() for ch in tts_text):
+                                await ws.convert(tts_text)
+                        else:  # explicit flush sentinel from the caller
+                            await ws.flush()
+                    # The input channel is exhausted (end_input() closed
+                    # it). Whatever text was sent above may still be
+                    # sitting unflushed in Sarvam's server-side buffer if
+                    # it never reached min_buffer_size and the caller's
+                    # last item wasn't itself a flush sentinel -- this is
+                    # exactly the "no audio frames were pushed" failure
+                    # mode for short replies. Always flush once more here
+                    # so the trailing text is guaranteed to be processed.
+                    await ws.flush()
 
-        try:
-            await ws.send_str(json.dumps({
-                "type": "config",
-                "data": {
-                    "model": self._tts._model,
-                    "target_language_code": self._tts._language,
-                    "speaker": self._tts._speaker,
-                    "output_audio_codec": "linear16",
-                    "speech_sample_rate": self._tts.sample_rate,
-                },
-            }))
-            sender_task = asyncio.create_task(sender())
+                sender_task = asyncio.create_task(sender())
 
-            async for msg in ws:
-                if msg.type != aiohttp.WSMsgType.TEXT:
-                    continue
-                ev = json.loads(msg.data)
-                etype = ev.get("type")
-                if etype == "audio":
-                    b64 = (ev.get("data") or {}).get("audio", "")
-                    if b64:
-                        output_emitter.push(base64.b64decode(b64))
-                elif etype == "event" and (ev.get("data") or {}).get("event_type") == "final":
-                    break
-                elif etype in {"complete", "completed"}:
-                    break
-                elif etype == "error":
-                    raise APIStatusError(message=json.dumps(ev)[:200], status_code=-1, request_id=None, body=None)
-
-            if not sender_task.done():
-                sender_task.cancel()
+                try:
+                    async for message in ws:
+                        if isinstance(message, AudioOutput):
+                            b64 = message.data.audio
+                            if b64:
+                                output_emitter.push(base64.b64decode(b64))
+                        elif isinstance(message, ErrorResponse):
+                            raise APIStatusError(
+                                message=message.data.message,
+                                status_code=message.data.code or -1,
+                                request_id=message.data.request_id,
+                                body=None,
+                            )
+                        elif isinstance(message, EventResponse):
+                            if message.data.event_type == "final":
+                                break
+                finally:
+                    if not sender_task.done():
+                        sender_task.cancel()
+                    # Retrieve/suppress the cancellation (or any exception
+                    # sender() raised) so it doesn't surface later as an
+                    # "asyncio - Task exception was never retrieved" log.
+                    # CancelledError is a BaseException (not Exception) as
+                    # of Python 3.8+, so it must be listed explicitly --
+                    # letting it escape here would replace/mask whatever
+                    # real exception (e.g. the APIStatusError above) is
+                    # already propagating out of this `finally`.
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
+                        await sender_task
 
         except asyncio.TimeoutError as e:
             raise APITimeoutError() from e
@@ -220,7 +296,3 @@ class SynthesizeStream(tts.SynthesizeStream):
             raise APIConnectionError() from e
         finally:
             output_emitter.end_segment()
-            try:
-                await ws.close()
-            except Exception:
-                pass

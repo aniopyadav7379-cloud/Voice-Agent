@@ -33,14 +33,35 @@ import uuid
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Must run before anything below reads os.environ — `agents.cli.run_app()`
+# at the bottom of this file needs LIVEKIT_URL/LIVEKIT_API_KEY/
+# LIVEKIT_API_SECRET, and every os.environ[...] lookup in entrypoint()
+# needs SARVAM_API_KEY/GROQ_API_KEY/DATABASE_URL etc. This process was
+# never reading .env at all before — it only ever worked in a terminal
+# session where those had separately been exported as real environment
+# variables by hand, and silently failed with "ws_url is required" (or a
+# bare KeyError for whichever var wasn't set) in any fresh shell.
+# `load_dotenv()` is a no-op (returns False, doesn't raise) when no .env
+# file is present, so this is safe in production too, where the platform
+# (Render, etc.) injects real env vars directly instead.
+#
+# override=True is deliberate: without it, a stale value already present
+# in the process/User environment silently wins over whatever's in .env.
+# That's exactly what happened here -- an old Groq key set once via
+# `[Environment]::SetEnvironmentVariable(..., "User")` persists at the
+# Windows registry level across every future terminal, forever, and kept
+# shadowing a correctly-rotated key that was already sitting in .env. If
+# you're editing .env to change a value, you want .env to win -- that's
+# the whole point of having it.
+load_dotenv(override=True)
 
 from livekit import agents, rtc
 from livekit.agents import Agent, AgentSession, JobContext, RunContext
 from livekit.agents.llm import ChatMessage
 from livekit.agents.llm import function_tool
 from livekit.agents.voice.events import ConversationItemAddedEvent
-from livekit.plugins import google, silero  # type: ignore
+from livekit.agents.llm import FallbackAdapter  # type: ignore
+from livekit.plugins import google, openai, silero  # type: ignore
 
 from app.context.moss_provider import MossContextProvider
 from app.context.orchestrator import ContextOrchestrator, LiveOperationalAPI
@@ -203,45 +224,76 @@ async def entrypoint(ctx: JobContext) -> None:
     # above — not a second bootstrap, not a second connection.
     tool_call_recorder = ToolCallRecorder(db)
 
+    # `db` is a single AsyncSession shared by every turn-persistence call
+    # AND the shutdown handler below. AsyncSession is not safe for
+    # concurrent use from multiple coroutines: `_persist_turn` is fired
+    # fire-and-forget via `asyncio.create_task` on every conversation
+    # turn (see session.on(...) below), so two turns arriving close
+    # together — or the final turn racing the job's shutdown callback —
+    # could both be mid-flush on the same connection at once. That's
+    # exactly what "InvalidRequestError: Session is already flushing"
+    # and "got Future ... attached to a different loop" were: not
+    # transient noise, but this session being driven from two coroutines
+    # simultaneously. This lock serializes every commit/rollback/close on
+    # `db` so persistence stays correct under real conversational load,
+    # not just in a single-turn smoke test where the race never triggers.
+    # (`tool_call_recorder` shares the same `db` too, via ToolRegistry —
+    # that path isn't touched here and remains a separate, pre-existing
+    # concern outside this fix's scope.)
+    db_lock = asyncio.Lock()
+
     async def _persist_turn(event: ConversationItemAddedEvent) -> None:
         item = event.item
         if not isinstance(item, ChatMessage):
             return  # AgentHandoff or other non-message items aren't conversation turns
         if item.role not in ("user", "assistant", "system"):
             return
-        try:
-            await recorder.record_turn(
-                tenant_id=identity.tenant_id,
-                session_id=voice_session_row.id,
-                role=TurnRole(item.role),
-                text=item.text_content or "",
-                # Per-turn language isn't tracked at this layer yet — Sarvam's
-                # STT reports language per-utterance (see
-                # voice_providers/sarvam/stt.py), but nothing in this
-                # entrypoint currently correlates that back to the specific
-                # ChatMessage this event carries. Real, stated gap, not
-                # fabricated — see STATUS_REPORT.md.
-                language=None,
-            )
-            await db.commit()
-        except Exception:
-            logger.exception("failed to persist conversation turn, continuing session")
-            await db.rollback()
+        async with db_lock:
+            try:
+                await recorder.record_turn(
+                    tenant_id=identity.tenant_id,
+                    session_id=voice_session_row.id,
+                    role=TurnRole(item.role),
+                    text=item.text_content or "",
+                    # Per-turn language isn't tracked at this layer yet — Sarvam's
+                    # STT reports language per-utterance (see
+                    # voice_providers/sarvam/stt.py), but nothing in this
+                    # entrypoint currently correlates that back to the specific
+                    # ChatMessage this event carries. Real, stated gap, not
+                    # fabricated — see STATUS_REPORT.md.
+                    language=None,
+                )
+                await db.commit()
+            except Exception:
+                logger.exception("failed to persist conversation turn, continuing session")
+                await db.rollback()
 
     async def _end_session_on_shutdown() -> None:
-        try:
-            await recorder.end_session(voice_session_row)
-            await db.commit()
-        except Exception:
-            logger.exception("failed to mark voice session as ended")
-        finally:
-            await db.close()
+        async with db_lock:
+            try:
+                await recorder.end_session(voice_session_row)
+                await db.commit()
+            except Exception:
+                logger.exception("failed to mark voice session as ended")
+            finally:
+                await db.close()
 
     ctx.add_shutdown_callback(_end_session_on_shutdown)
 
     session: AgentSession = AgentSession(
         stt=SarvamSTT(api_key=os.environ["SARVAM_API_KEY"]),
-        llm=google.LLM(model=os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")),
+        llm=FallbackAdapter(
+            [
+                openai.LLM(
+                    model=os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b"),
+                    api_key=os.environ["GROQ_API_KEY"],
+                    base_url="https://api.groq.com/openai/v1",
+                    _strict_tool_schema=False,
+                ),
+                google.LLM(model=os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")),
+            ],
+            attempt_timeout=15.0,
+        ),
         tts=SarvamTTS(api_key=os.environ["SARVAM_API_KEY"], target_language="en-IN"),
         vad=silero.VAD.load(),
     )
