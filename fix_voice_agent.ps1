@@ -1,3 +1,50 @@
+#Requires -Version 5.1
+<#
+Applies the TTS-swap fix (custom Sarvam client -> official livekit-plugins-sarvam)
+to agent\app\agent_entrypoint.py and agent\requirements.txt.
+
+- Backs up both files (timestamped .bak) before touching them.
+- Never touches .env or any file under agent\app\voice_providers\.
+- Safe to re-run; each run makes a fresh backup before overwriting.
+
+Run from the project ROOT (the folder containing "agent\"):
+    cd "C:\Users\aniop\Downloads\voice-agent-platform-FINAL\voice-agent-platform"
+    .\fix_voice_agent.ps1
+#>
+
+$ErrorActionPreference = "Stop"
+
+$root = Get-Location
+$agentDir = Join-Path $root "agent"
+
+if (-not (Test-Path $agentDir)) {
+    Write-Error "Can't find '$agentDir'. Run this script from voice-agent-platform-FINAL\voice-agent-platform (the folder that contains 'agent\')."
+    exit 1
+}
+
+$entrypointPath   = Join-Path $agentDir "app\agent_entrypoint.py"
+$requirementsPath = Join-Path $agentDir "requirements.txt"
+
+foreach ($p in @($entrypointPath, $requirementsPath)) {
+    if (-not (Test-Path $p)) {
+        Write-Error "Expected file not found: $p"
+        exit 1
+    }
+}
+
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+
+Write-Host "Backing up existing files..." -ForegroundColor Cyan
+Copy-Item $entrypointPath   "$entrypointPath.$stamp.bak"
+Copy-Item $requirementsPath "$requirementsPath.$stamp.bak"
+Write-Host "  Backed up to:"
+Write-Host "    $entrypointPath.$stamp.bak"
+Write-Host "    $requirementsPath.$stamp.bak"
+
+# ---------------------------------------------------------------------------
+# agent\app\agent_entrypoint.py
+# ---------------------------------------------------------------------------
+$entrypointContent = @'
 """
 LiveKit Agents entrypoint. Structure follows moss-main's own official
 reference agent (apps/livekit-moss-vercel/.../agent.py) — an `Agent`
@@ -373,3 +420,42 @@ async def aiter_db_session():
 
 if __name__ == "__main__":
     agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))
+'@
+
+Write-Host "Writing agent_entrypoint.py..." -ForegroundColor Cyan
+[System.IO.File]::WriteAllText($entrypointPath, $entrypointContent, (New-Object System.Text.UTF8Encoding($false)))
+
+# ---------------------------------------------------------------------------
+# agent\requirements.txt
+# ---------------------------------------------------------------------------
+$requirementsContent = @'
+livekit-agents
+livekit-plugins-google
+livekit-plugins-openai
+livekit-plugins-silero
+livekit-plugins-sarvam
+python-dotenv
+moss
+qdrant-client
+sentence-transformers
+pydantic
+aiohttp
+sqlalchemy
+asyncpg
+alembic
+fastapi
+pyjwt
+uvicorn
+'@
+
+Write-Host "Writing requirements.txt..." -ForegroundColor Cyan
+[System.IO.File]::WriteAllText($requirementsPath, $requirementsContent, (New-Object System.Text.UTF8Encoding($false)))
+
+Write-Host ""
+Write-Host "Done. Files were NOT deleted, only backed up + overwritten:" -ForegroundColor Green
+Write-Host "  $entrypointPath"
+Write-Host "  $requirementsPath"
+Write-Host ""
+Write-Host "Nothing under agent\app\voice_providers\ was touched. .env was not touched." -ForegroundColor Green
+Write-Host ""
+Write-Host "Next: pip install -r agent\requirements.txt, then start the agent." -ForegroundColor Yellow

@@ -2,7 +2,7 @@ livekit-agents
 livekit-plugins-google
 livekit-plugins-openai
 livekit-plugins-silero
-sarvamai
+livekit-plugins-sarvam
 python-dotenv
 moss
 qdrant-client
