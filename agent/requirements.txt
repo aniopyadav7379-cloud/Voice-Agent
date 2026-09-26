@@ -9,7 +9,7 @@ qdrant-client
 sentence-transformers
 pydantic
 aiohttp
-sqlalchemy
+sqlalchemy[asyncio]
 asyncpg
 alembic
 fastapi
