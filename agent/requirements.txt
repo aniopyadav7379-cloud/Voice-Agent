@@ -9,9 +9,11 @@ qdrant-client
 sentence-transformers
 pydantic
 aiohttp
+sarvamai
 sqlalchemy[asyncio]
 asyncpg
 alembic
 fastapi
 pyjwt
+cryptography
 uvicorn

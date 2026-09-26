@@ -1,4 +1,4 @@
-﻿import { useCallback, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import {
   ConnectionState,
   DisconnectReason,
@@ -67,6 +67,19 @@ export function useLiveKit() {
         setConnectionPhase("error");
         return;
       }
+
+      // Tear down any existing room connection and audio elements to prevent duplicate sessions
+      if (roomRef.current) {
+        try {
+          await roomRef.current.disconnect();
+        } catch {
+          // ignore
+        }
+        roomRef.current = null;
+      }
+      document.querySelectorAll('[data-livekit-agent-audio="true"]').forEach((el) => {
+        el.remove();
+      });
 
       setConnectionPhase("connecting");
       const room = new Room(DEFAULT_ROOM_OPTIONS);
@@ -236,6 +249,15 @@ export function useLiveKit() {
     const room = roomRef.current;
     if (!room) return;
     setConnectionPhase("disconnecting");
+
+    document.querySelectorAll('[data-livekit-agent-audio="true"]').forEach((el) => {
+      if (el instanceof HTMLMediaElement) {
+        el.pause();
+        el.srcObject = null;
+      }
+      el.remove();
+    });
+
     await room.disconnect();
     roomRef.current = null;
     setTranscript([]);

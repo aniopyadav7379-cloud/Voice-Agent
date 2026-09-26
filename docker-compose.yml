@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  token-service:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    command: ["uvicorn", "app.security.token_service:app", "--host", "0.0.0.0", "--port", "8000"]
+    container_name: voice-agent-token-service
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./agent/.env
+    environment:
+      - ENVIRONMENT=production
+      - ALLOWED_ORIGINS=http://localhost:3000,http://localhost:5173
+    networks:
+      - voice-agent-net
+
+  agent-worker:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    command: ["python", "app/agent_entrypoint.py", "start"]
+    container_name: voice-agent-worker
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    env_file:
+      - ./agent/.env
+    depends_on:
+      - token-service
+    networks:
+      - voice-agent-net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_BASE_URL=http://localhost:8000
+    container_name: voice-agent-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - token-service
+    networks:
+      - voice-agent-net
+
+networks:
+  voice-agent-net:
+    driver: bridge

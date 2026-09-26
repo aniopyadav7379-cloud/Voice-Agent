@@ -45,8 +45,12 @@ from typing import NamedTuple
 REQUIRED_VARS = [
     "DATABASE_URL", "JWT_SECRET", "JWT_ISSUER", "ENVIRONMENT",
     "LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
-    "MOSS_PROJECT_ID", "MOSS_PROJECT_KEY", "SARVAM_API_KEY",
-    "QDRANT_LOCATION", "GEMINI_MODEL", "GOOGLE_API_KEY",
+    "SARVAM_API_KEY",
+]
+
+OPTIONAL_VARS = [
+    "GROQ_API_KEY", "GROQ_MODEL", "GOOGLE_API_KEY", "GEMINI_MODEL",
+    "MOSS_PROJECT_ID", "MOSS_PROJECT_KEY", "QDRANT_LOCATION", "ALLOWED_ORIGINS",
 ]
 
 
@@ -126,22 +130,13 @@ async def check_database() -> CheckResult:
 
     parsed = urllib.parse.urlsplit(url.replace("postgresql+asyncpg://", "postgresql://", 1))
     try:
-        socket.setdefaulttimeout(6)
-        with socket.create_connection((parsed.hostname, parsed.port or 5432), timeout=6):
-            pass
-    except socket.gaierror as e:
-        return CheckResult("NETWORK BLOCKED", f"DNS resolution failed for {parsed.hostname}: {e}")
-    except (TimeoutError, ConnectionRefusedError, OSError) as e:
-        return CheckResult("NETWORK BLOCKED", f"TCP connect to {parsed.hostname}:{parsed.port or 5432} failed: {e}")
-
-    try:
         import asyncpg
     except ImportError:
         return CheckResult("ERROR", "asyncpg not installed (pip install asyncpg)")
 
     dsn = url.replace("postgresql+asyncpg://", "postgresql://", 1)
     try:
-        conn = await asyncio.wait_for(asyncpg.connect(dsn=dsn), timeout=10)
+        conn = await asyncio.wait_for(asyncpg.connect(dsn=dsn, timeout=15), timeout=20)
         result = await conn.fetchval("SELECT 1")
         await conn.close()
         return CheckResult("AUTHENTICATED", f"SELECT 1 -> {result}")
@@ -161,19 +156,14 @@ async def check_livekit() -> CheckResult:
     if not all([url, key, secret]):
         return CheckResult("MISSING", "LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET not fully set")
 
-    host = urllib.parse.urlsplit(url.replace("wss://", "https://").replace("ws://", "http://")).hostname
-    blocked = await egress_probe(host)
-    if blocked:
-        return blocked
-
     try:
         from livekit import api
     except ImportError:
         return CheckResult("ERROR", "livekit-api not installed (pip install livekit-api)")
 
-    lk = api.LiveKitAPI(url=url, api_key=key, api_secret=secret)
     try:
-        rooms = await asyncio.wait_for(lk.room.list_rooms(api.ListRoomsRequest()), timeout=10)
+        lk = api.LiveKitAPI(url=url, api_key=key, api_secret=secret)
+        rooms = await asyncio.wait_for(lk.room.list_rooms(api.ListRoomsRequest()), timeout=15)
         return CheckResult("AUTHENTICATED", f"ListRooms succeeded -- {len(rooms.rooms)} room(s) currently active")
     except Exception as e:
         msg = str(e)
@@ -181,7 +171,10 @@ async def check_livekit() -> CheckResult:
             return CheckResult("REJECTED", f"{type(e).__name__}: {e}")
         return CheckResult("ERROR", f"{type(e).__name__}: {e}")
     finally:
-        await lk.aclose()
+        try:
+            await lk.aclose()
+        except Exception:
+            pass
 
 
 async def check_sarvam_tts() -> CheckResult:
@@ -190,10 +183,6 @@ async def check_sarvam_tts() -> CheckResult:
     key = os.environ.get("SARVAM_API_KEY")
     if not key:
         return CheckResult("MISSING", "SARVAM_API_KEY not set")
-
-    blocked = await egress_probe("api.sarvam.ai")
-    if blocked:
-        return blocked
 
     try:
         import aiohttp
@@ -208,8 +197,8 @@ async def check_sarvam_tts() -> CheckResult:
                 json={
                     "inputs": ["preflight check"],
                     "target_language_code": "en-IN",
-                    "speaker": "anushka",
-                    "model": "bulbul:v2",
+                    "speaker": "shubh",
+                    "model": "bulbul:v3",
                 },
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
@@ -231,13 +220,6 @@ async def check_moss() -> CheckResult:
     if not all([project_id, project_key]):
         return CheckResult("MISSING", "MOSS_PROJECT_ID / MOSS_PROJECT_KEY not fully set")
 
-    # Moss's actual API hosts (found by inspecting the compiled moss_core
-    # extension -- not documented in the Python package itself).
-    for host in ("service.usemoss.dev", "models.moss.link"):
-        blocked = await egress_probe(host)
-        if blocked:
-            return blocked
-
     try:
         from moss import MossClient
     except ImportError:
@@ -245,7 +227,7 @@ async def check_moss() -> CheckResult:
 
     try:
         client = MossClient(project_id, project_key)
-        indexes = await asyncio.wait_for(client.list_indexes(), timeout=10)
+        indexes = await asyncio.wait_for(client.list_indexes(), timeout=15)
         count = len(indexes) if hasattr(indexes, "__len__") else "?"
         return CheckResult("AUTHENTICATED", f"list_indexes() succeeded -- {count} index(es)")
     except Exception as e:
@@ -269,7 +251,7 @@ async def check_google() -> CheckResult:
     if blocked:
         return blocked
 
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
     try:
         import aiohttp
     except ImportError:
@@ -293,6 +275,37 @@ async def check_google() -> CheckResult:
         return CheckResult("ERROR", f"{type(e).__name__}: {e}")
 
 
+async def check_groq() -> CheckResult:
+    key = os.environ.get("GROQ_API_KEY")
+    if not key:
+        return CheckResult("MISSING", "GROQ_API_KEY not set (optional if GOOGLE_API_KEY is configured)")
+
+    blocked = await egress_probe("api.groq.com")
+    if blocked:
+        return blocked
+
+    model = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
+    try:
+        import aiohttp
+    except ImportError:
+        return CheckResult("ERROR", "aiohttp not installed (pip install aiohttp)")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={"model": model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 5},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status == 200:
+                    return CheckResult("AUTHENTICATED", f"chat/completions against {model} -> 200 OK")
+                body = (await resp.text())[:150]
+                return CheckResult("REJECTED" if resp.status in (401, 403) else "ERROR", f"HTTP {resp.status}: {body}")
+    except Exception as e:
+        return CheckResult("ERROR", f"{type(e).__name__}: {e}")
+
+
 async def main() -> int:
     env_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), ".env")
     loaded = load_env_file(env_path)
@@ -303,6 +316,11 @@ async def main() -> int:
     for name in REQUIRED_VARS:
         val = os.environ.get(name)
         print(f"{name:20} {'PRESENT ' + mask(val) if val else 'MISSING'}")
+    print("\nOPTIONAL / EXTENSION VARS:")
+    for name in OPTIONAL_VARS:
+        val = os.environ.get(name)
+        print(f"{name:20} {'PRESENT ' + mask(val) if val else 'NOT SET'}")
+
     if not loaded:
         print(f"\n(no .env file found at {env_path} -- using process environment only)")
 
@@ -316,8 +334,12 @@ async def main() -> int:
         ("LiveKit", check_livekit()),
         ("Sarvam TTS", check_sarvam_tts()),
         ("Moss", check_moss()),
-        ("Google / LLM", check_google()),
     ]
+    if os.environ.get("GROQ_API_KEY"):
+        checks.append(("Groq / LLM", check_groq()))
+    if os.environ.get("GOOGLE_API_KEY") or not os.environ.get("GROQ_API_KEY"):
+        checks.append(("Google / LLM", check_google()))
+
     results: dict[str, CheckResult] = {}
     for name, coro in checks:
         result = await coro
@@ -329,7 +351,9 @@ async def main() -> int:
     print("=" * 27)
 
     def line(name: str, key: str) -> None:
-        r = results[key]
+        r = results.get(key)
+        if not r:
+            return
         verdict = "PASS" if r.status == "AUTHENTICATED" else "FAIL"
         print(f"{name}: {verdict}  ({r.status})")
 
@@ -337,7 +361,10 @@ async def main() -> int:
     line("LiveKit", "LiveKit")
     line("Sarvam TTS", "Sarvam TTS")
     line("Moss", "Moss")
-    line("LLM (Google)", "Google / LLM")
+    if "Groq / LLM" in results:
+        line("LLM (Groq)", "Groq / LLM")
+    if "Google / LLM" in results:
+        line("LLM (Google)", "Google / LLM")
 
     network_blocked = any(r.status == "NETWORK BLOCKED" for r in results.values())
     rejected = any(r.status == "REJECTED" for r in results.values())

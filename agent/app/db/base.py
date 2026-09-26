@@ -1,4 +1,4 @@
-﻿"""
+"""
 Async SQLAlchemy engine/session setup.
 """
 
@@ -22,7 +22,8 @@ def build_engine(database_url: str, *, test_mode: bool = False):
     connect_args = {
         "prepared_statement_cache_size": 0,
         "statement_cache_size": 0,
-        "command_timeout": 10,
+        "command_timeout": 30,
+        "timeout": 30,
     }
 
     if test_mode:

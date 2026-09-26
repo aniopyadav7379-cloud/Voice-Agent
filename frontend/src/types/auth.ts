@@ -15,6 +15,7 @@ export interface DevTokenResponse {
   livekit_token: string;
   tenant_id: string;
   user_id: string;
+  livekit_url?: string;
 }
 
 export interface LiveKitTokenRequest {
@@ -25,6 +26,7 @@ export interface LiveKitTokenResponse {
   livekit_token: string;
   tenant_id: string;
   user_id: string;
+  livekit_url?: string;
 }
 
 /** What we persist in sessionStorage under SESSION_STORAGE_KEY. */

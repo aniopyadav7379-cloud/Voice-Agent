@@ -1,4 +1,4 @@
-﻿"""
+"""
 Thin abstraction over the real `moss` SDK.
 
 Per-tenant isolation: Moss indexes are namespaced by tenant at the
@@ -31,6 +31,7 @@ class MossContextProvider:
     def __init__(self, project_id: str, project_key: str):
         self._client = MossClient(project_id, project_key)
         self._loaded_indexes: set[str] = set()
+        self._failed_indexes: set[str] = set()
 
     @staticmethod
     def _index_name(tenant_id: str, logical_name: str) -> str:
@@ -45,11 +46,17 @@ class MossContextProvider:
         """Load a tenant-scoped Moss index once per provider instance."""
         index_name = self._index_name(tenant_id, logical_name)
 
+        if index_name in self._failed_indexes:
+            raise MossUnavailableError(
+                f"Moss index {index_name} previously failed to load"
+            )
+
         if index_name not in self._loaded_indexes:
             try:
                 await self._client.load_index(index_name)
                 self._loaded_indexes.add(index_name)
             except Exception as e:
+                self._failed_indexes.add(index_name)
                 raise MossUnavailableError(
                     f"failed to load Moss index {index_name}"
                 ) from e

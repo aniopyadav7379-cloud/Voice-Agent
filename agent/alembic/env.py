@@ -29,6 +29,12 @@ target_metadata = Base.metadata
 # DATABASE_URL always comes from the environment, never from alembic.ini —
 # alembic.ini has no sqlalchemy.url value committed, deliberately, so there
 # is nothing credential-shaped to leak via that file.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+except ImportError:
+    pass
+
 db_url = os.environ.get("DATABASE_URL")
 if db_url:
     config.set_main_option("sqlalchemy.url", db_url)
@@ -59,6 +65,12 @@ async def run_async_migrations() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        connect_args={
+            "prepared_statement_cache_size": 0,
+            "statement_cache_size": 0,
+            "timeout": 30,
+            "command_timeout": 30,
+        },
     )
 
     async with connectable.connect() as connection:

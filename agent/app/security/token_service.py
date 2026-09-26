@@ -20,6 +20,9 @@ structurally incapable of running outside dev).
 """
 import logging
 import os
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
 
 from fastapi import FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,14 +51,24 @@ app = FastAPI(title="voice-agent-platform-token-service")
 # "http://localhost:5173,https://your-app.vercel.app". No wildcard default:
 # an empty/unset value means no browser origin is allowed, fixed open on
 # purpose rather than silently permissive.
-_allowed_origins = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+_origins_from_env = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+if not _origins_from_env and os.environ.get("ENVIRONMENT") == "development":
+    _allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000"]
+else:
+    _allowed_origins = _origins_from_env
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
-    allow_credentials=False,
-    allow_methods=["POST"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "service": "voice-agent-platform-token-service"}
 
 
 class DevTokenRequest(BaseModel):
@@ -69,6 +82,7 @@ class DevTokenResponse(BaseModel):
     livekit_token: str  # real LiveKit access token, minted via mint_livekit_token
     tenant_id: str
     user_id: str
+    livekit_url: str = ""
 
 
 async def _ensure_dev_tenant_and_user(db, *, tenant_slug: str, external_id: str) -> AuthenticatedIdentity:
@@ -121,6 +135,7 @@ async def issue_dev_token(body: DevTokenRequest) -> DevTokenResponse:
     return DevTokenResponse(
         access_token=app_token, livekit_token=livekit_token,
         tenant_id=str(identity.tenant_id), user_id=str(identity.user_id),
+        livekit_url=os.environ.get("LIVEKIT_URL", ""),
     )
 
 
@@ -132,6 +147,7 @@ class LiveKitTokenResponse(BaseModel):
     livekit_token: str
     tenant_id: str
     user_id: str
+    livekit_url: str = ""
 
 
 @app.post("/v1/livekit/token", response_model=LiveKitTokenResponse)
@@ -213,4 +229,5 @@ async def issue_livekit_token(
     )
     return LiveKitTokenResponse(
         livekit_token=livekit_token, tenant_id=str(identity.tenant_id), user_id=str(identity.user_id),
+        livekit_url=os.environ.get("LIVEKIT_URL", ""),
     )

@@ -6,6 +6,7 @@ import type { StoredSession } from "../types/auth";
 interface ConnectResult {
   livekitToken: string;
   roomName: string;
+  livekitUrl?: string;
 }
 
 export function useAuth() {
@@ -34,7 +35,7 @@ export function useAuth() {
         };
         saveStoredSession(next);
         setSession(next);
-        return { livekitToken: response.livekit_token, roomName };
+        return { livekitToken: response.livekit_token, roomName, livekitUrl: response.livekit_url };
       } catch (err) {
         const message =
           err instanceof ApiRequestError
@@ -59,7 +60,7 @@ export function useAuth() {
     const roomName = generateRoomName();
     try {
       const response = await fetchLiveKitToken(session.accessToken, { room_name: roomName });
-      return { livekitToken: response.livekit_token, roomName };
+      return { livekitToken: response.livekit_token, roomName, livekitUrl: response.livekit_url };
     } catch (err) {
       const message =
         err instanceof ApiRequestError

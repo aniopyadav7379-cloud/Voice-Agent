@@ -13,9 +13,8 @@ function App() {
   const { preference, setPreference } = useTheme();
   const { session, isAuthenticating, authError, bootstrap, startNewSession } = useAuth();
   const {
-    connectionPhase,
-    setConnectionPhase,
-    micPhase,
+  connectionPhase,
+  micPhase,
     agentState,
     agentIdentity,
     localAudioLevel,
@@ -35,23 +34,25 @@ function App() {
 
   const handleBootstrap = useCallback(
     async (tenantSlug: string, externalId: string) => {
+      if (connectionPhase === "connecting" || connectionPhase === "connected" || isAuthenticating) return;
       const result = await bootstrap(tenantSlug, externalId).catch(() => null);
       if (!result) return;
-      setConnectionPhase("ready_to_connect");
-      await connect(LIVEKIT_URL, result.livekitToken);
+      const targetUrl = result.livekitUrl || LIVEKIT_URL;
+      await connect(targetUrl, result.livekitToken);
     },
-    [bootstrap, connect, setConnectionPhase],
+    [bootstrap, connect, connectionPhase, isAuthenticating],
   );
 
   const handleConnect = useCallback(async () => {
-    if (!session) return;
+    if (!session || connectionPhase === "connecting" || connectionPhase === "connected" || isAuthenticating) return;
     try {
-      const { livekitToken } = await startNewSession();
-      await connect(LIVEKIT_URL, livekitToken);
+      const { livekitToken, livekitUrl } = await startNewSession();
+      const targetUrl = livekitUrl || LIVEKIT_URL;
+      await connect(targetUrl, livekitToken);
     } catch {
       // authError from useAuth already reflects this; nothing further to do.
     }
-  }, [session, startNewSession, connect]);
+  }, [session, startNewSession, connect, connectionPhase, isAuthenticating]);
 
   const handleDisconnect = useCallback(async () => {
     await disconnect();
@@ -95,6 +96,7 @@ function App() {
       onToggleMute={toggleMute}
       signInSlot={signInSlot}
       showSignIn={showSignIn}
+      isAuthenticating={isAuthenticating}
     />
   );
 }

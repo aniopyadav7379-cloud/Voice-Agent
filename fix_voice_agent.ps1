@@ -8,7 +8,6 @@ to agent\app\agent_entrypoint.py and agent\requirements.txt.
 - Safe to re-run; each run makes a fresh backup before overwriting.
 
 Run from the project ROOT (the folder containing "agent\"):
-    cd "C:\Users\aniop\Downloads\voice-agent-platform-FINAL\voice-agent-platform"
     .\fix_voice_agent.ps1
 #>
 
@@ -18,7 +17,7 @@ $root = Get-Location
 $agentDir = Join-Path $root "agent"
 
 if (-not (Test-Path $agentDir)) {
-    Write-Error "Can't find '$agentDir'. Run this script from voice-agent-platform-FINAL\voice-agent-platform (the folder that contains 'agent\')."
+    Write-Error "Can't find '$agentDir'. Run this script from the repository root directory."
     exit 1
 }
 
@@ -122,13 +121,17 @@ from app.db.session_manager import (
     VoiceSessionRecorder,
     is_tenant_verified,
 )
+from app.security.identity import AuthenticatedIdentity, IdentitySource
 from app.security.session_boundary import (
     AuthenticationRejectedError,
     SessionBoundaryError,
     enforce_single_participant,
     establish_authenticated_session,
 )
+from app.tools.create_ticket import CREATE_TICKET_CONTRACT, build_create_ticket_handler
 from app.tools.definitions import build_tool_registry
+from app.tools.executor import ContractToolExecutor
+from app.tools.ticket_service import InMemoryTicketService
 from app.voice_providers.sarvam.stt import STT as SarvamSTT
 from livekit.plugins.sarvam import TTS as SarvamTTS
 
@@ -146,6 +149,7 @@ class FieldOpsAssistant(Agent):
     def __init__(
         self, *, tenant_id: str, session_id: str, orchestrator: ContextOrchestrator, room=None,
         tool_call_recorder=None, tenant_uuid=None, session_uuid=None, user_uuid=None,
+        contract_executor=None, ticket_service=None,
     ):
         super().__init__(
             instructions=(
@@ -165,14 +169,34 @@ class FieldOpsAssistant(Agent):
         self._orchestrator = orchestrator
         self._tool_registry = build_tool_registry()
         self._room = room
-        # Optional — see registry.py's execute() docstring. None of these
-        # being unset (e.g. in a test that constructs FieldOpsAssistant
-        # directly) just means tool calls fall back to in-memory-only
-        # auditing, exactly as before this milestone.
         self._tool_call_recorder = tool_call_recorder
         self._tenant_uuid = tenant_uuid
         self._session_uuid = session_uuid
         self._user_uuid = user_uuid
+        self._contract_executor = contract_executor
+        self._ticket_service = ticket_service or InMemoryTicketService()
+
+    async def _broadcast_tool_event(self, name: str, status: str, detail: str | None = None) -> None:
+        if not self._room:
+            return
+        local_p = getattr(self._room, "local_participant", None)
+        if not local_p:
+            return
+        publish_fn = getattr(local_p, "publish_data", None)
+        if not callable(publish_fn):
+            return
+        try:
+            import json
+            payload = json.dumps({
+                "name": name,
+                "status": status,
+                "detail": detail,
+            }).encode("utf-8")
+            res = publish_fn(payload, topic="tool_event")
+            if asyncio.iscoroutine(res):
+                await res
+        except Exception:
+            logger.debug("Failed to broadcast tool event %s", name, exc_info=True)
 
     @function_tool
     async def retrieve_context(self, context: RunContext, query: str) -> str:
@@ -198,13 +222,37 @@ class FieldOpsAssistant(Agent):
         send_notification, etc). Only tools in the registry can be called —
         arbitrary tool names are rejected. NEVER report success to the user
         unless this call's result says success=True."""
-        result = await self._tool_registry.execute(
-            tool_name=tool_name, raw_args=arguments, tenant_id=self._tenant_id, session_id=self._session_id,
-            db_recorder=self._tool_call_recorder, tenant_uuid=self._tenant_uuid, session_uuid=self._session_uuid,
-            user_uuid=self._user_uuid,
-        )
+        await self._broadcast_tool_event(tool_name, "started", f"Executing {tool_name}...")
+
+        if tool_name == "create_ticket" and self._contract_executor is not None and self._tenant_uuid is not None:
+            identity = AuthenticatedIdentity(
+                user_id=self._user_uuid,
+                tenant_id=self._tenant_uuid,
+                tenant_slug=self._tenant_id,
+                external_id="field-user",
+                source=IdentitySource.LIVEKIT_PARTICIPANT,
+            )
+            handler = build_create_ticket_handler(self._ticket_service)
+            result = await self._contract_executor.execute(
+                contract=CREATE_TICKET_CONTRACT,
+                handler=handler,
+                raw_args=arguments,
+                identity=identity,
+                session_uuid=self._session_uuid or uuid.uuid4(),
+            )
+        else:
+            result = await self._tool_registry.execute(
+                tool_name=tool_name, raw_args=arguments, tenant_id=self._tenant_id, session_id=self._session_id,
+                db_recorder=self._tool_call_recorder, tenant_uuid=self._tenant_uuid, session_uuid=self._session_uuid,
+                user_uuid=self._user_uuid,
+            )
+
         if result.success:
+            detail = result.output.get("message") if isinstance(result.output, dict) else str(result.output)
+            await self._broadcast_tool_event(tool_name, "succeeded", detail or "Completed")
             return f"SUCCESS: {result.output}"
+
+        await self._broadcast_tool_event(tool_name, "failed", str(result.error))
         return f"FAILED: {result.error}"
 
 
@@ -244,9 +292,14 @@ async def entrypoint(ctx: JobContext) -> None:
     # real, validated tenant rather than an arbitrary room-metadata string.
     tenant_id = identity.tenant_slug
 
-    moss = MossContextProvider(
-        project_id=os.environ["MOSS_PROJECT_ID"], project_key=os.environ["MOSS_PROJECT_KEY"]
-    )
+    moss_project_id = os.environ.get("MOSS_PROJECT_ID")
+    moss_project_key = os.environ.get("MOSS_PROJECT_KEY")
+    if moss_project_id and moss_project_key:
+        moss = MossContextProvider(project_id=moss_project_id, project_key=moss_project_key)
+    else:
+        logger.info("Moss credentials not configured; in-session fast context disabled")
+        moss = None
+
     from qdrant_client import AsyncQdrantClient
     from app.context.embeddings import SentenceTransformerEmbedder
 
@@ -257,37 +310,16 @@ async def entrypoint(ctx: JobContext) -> None:
     orchestrator = ContextOrchestrator(moss, knowledge, live_api=LiveOperationalAPI())
 
     # --- Postgres persistence bootstrap ---
-    # A single DB session is held for the lifetime of this job — same
-    # per-connection-scoped pattern as the rest of this app, not a new
-    # convention. `tenant_id`/`session_id` above (the plain strings Moss/
-    # Qdrant/tools use) are NOT replaced by the UUIDs below; see
-    # session_manager.py's docstring for why both identity schemes
-    # coexist deliberately.
     recorder = VoiceSessionRecorder(db)
     voice_session_row = await recorder.start_session(
         tenant_id=identity.tenant_id, user_id=identity.user_id, initial_language="en-IN",
     )
     await db.commit()
-    # Same shared db session, same tenant/session UUIDs already resolved
-    # above — not a second bootstrap, not a second connection.
-    tool_call_recorder = ToolCallRecorder(db)
 
-    # `db` is a single AsyncSession shared by every turn-persistence call
-    # AND the shutdown handler below. AsyncSession is not safe for
-    # concurrent use from multiple coroutines: `_persist_turn` is fired
-    # fire-and-forget via `asyncio.create_task` on every conversation
-    # turn (see session.on(...) below), so two turns arriving close
-    # together — or the final turn racing the job's shutdown callback —
-    # could both be mid-flush on the same connection at once. That's
-    # exactly what "InvalidRequestError: Session is already flushing"
-    # and "got Future ... attached to a different loop" were: not
-    # transient noise, but this session being driven from two coroutines
-    # simultaneously. This lock serializes every commit/rollback/close on
-    # `db` so persistence stays correct under real conversational load,
-    # not just in a single-turn smoke test where the race never triggers.
-    # (`tool_call_recorder` shares the same `db` too, via ToolRegistry —
-    # that path isn't touched here and remains a separate, pre-existing
-    # concern outside this fix's scope.)
+    tool_call_recorder = ToolCallRecorder(db)
+    contract_executor = ContractToolExecutor(db, tool_call_recorder)
+    ticket_service = InMemoryTicketService()
+
     db_lock = asyncio.Lock()
 
     async def _persist_turn(event: ConversationItemAddedEvent) -> None:
@@ -303,12 +335,6 @@ async def entrypoint(ctx: JobContext) -> None:
                     session_id=voice_session_row.id,
                     role=TurnRole(item.role),
                     text=item.text_content or "",
-                    # Per-turn language isn't tracked at this layer yet — Sarvam's
-                    # STT reports language per-utterance (see
-                    # voice_providers/sarvam/stt.py), but nothing in this
-                    # entrypoint currently correlates that back to the specific
-                    # ChatMessage this event carries. Real, stated gap, not
-                    # fabricated — see STATUS_REPORT.md.
                     language=None,
                 )
                 await db.commit()
@@ -328,22 +354,42 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(_end_session_on_shutdown)
 
+    sarvam_key = os.environ.get("SARVAM_API_KEY", "")
+    if not sarvam_key:
+        raise RuntimeError("SARVAM_API_KEY is required for voice STT/TTS")
+
+    llm_candidates = []
+    groq_key = os.environ.get("GROQ_API_KEY")
+    if groq_key:
+        groq_model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+        llm_candidates.append(
+            openai.LLM(
+                model=groq_model,
+                api_key=groq_key,
+                base_url="https://api.groq.com/openai/v1",
+                _strict_tool_schema=False,
+            )
+        )
+
+    google_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    if google_key or not llm_candidates:
+        if google_key and "GOOGLE_API_KEY" not in os.environ:
+            os.environ["GOOGLE_API_KEY"] = google_key
+        gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+        llm_candidates.append(google.LLM(model=gemini_model))
+
+    if len(llm_candidates) > 1:
+        llm_plugin = FallbackAdapter(llm_candidates, attempt_timeout=15.0)
+    elif llm_candidates:
+        llm_plugin = llm_candidates[0]
+    else:
+        raise RuntimeError("At least one of GROQ_API_KEY or GOOGLE_API_KEY must be provided")
+
     session: AgentSession = AgentSession(
-        stt=SarvamSTT(api_key=os.environ["SARVAM_API_KEY"]),
-        llm=FallbackAdapter(
-            [
-                openai.LLM(
-                    model=os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b"),
-                    api_key=os.environ["GROQ_API_KEY"],
-                    base_url="https://api.groq.com/openai/v1",
-                    _strict_tool_schema=False,
-                ),
-                google.LLM(model=os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")),
-            ],
-            attempt_timeout=15.0,
-        ),
+        stt=SarvamSTT(api_key=sarvam_key),
+        llm=llm_plugin,
         tts=SarvamTTS(
-            api_key=os.environ["SARVAM_API_KEY"],
+            api_key=sarvam_key,
             target_language_code="en-IN",
             model="bulbul:v3",
             speaker="shubh",
@@ -360,6 +406,7 @@ async def entrypoint(ctx: JobContext) -> None:
             tenant_id=tenant_id, session_id=session_id, orchestrator=orchestrator, room=ctx.room,
             tool_call_recorder=tool_call_recorder, tenant_uuid=identity.tenant_id,
             session_uuid=voice_session_row.id, user_uuid=identity.user_id,
+            contract_executor=contract_executor, ticket_service=ticket_service,
         ),
     )
 
@@ -440,7 +487,8 @@ qdrant-client
 sentence-transformers
 pydantic
 aiohttp
-sqlalchemy
+sarvamai
+sqlalchemy[asyncio]
 asyncpg
 alembic
 fastapi

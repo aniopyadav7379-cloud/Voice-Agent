@@ -1,4 +1,4 @@
-﻿"""
+"""
 Sarvam STT as a real LiveKit `stt.STT` plugin.
 
 PORTED, not reinvented, from Voice-AI-Agent-master's `SarvamSTTService`
@@ -73,7 +73,7 @@ FINALIZE_TIMEOUT_SECS = 3.0
 
 
 class STT(stt.STT):
-    def __init__(self, *, api_key: str, model: str = "saarika:v2", mode: str | None = None):
+    def __init__(self, *, api_key: str, model: str = "saaras:v3", mode: str | None = None):
         super().__init__(
             capabilities=stt.STTCapabilities(
                 streaming=True,
@@ -238,6 +238,9 @@ class SpeechStream(stt.SpeechStream):
                     got_result.set()
                     return
 
+        resampler: Any | None = None
+        current_sample_rate: int | None = None
+
         async for data in self._input_ch:
             if isinstance(data, rtc.AudioFrame):
                 if not utterance_started:
@@ -247,34 +250,70 @@ class SpeechStream(stt.SpeechStream):
                     latest_result = None
                     stream_failed = False
                     buffered_frames = []
+                    resampler = None
+                    current_sample_rate = None
                     try:
                         ws = await session.ws_connect(url, headers={"Api-Subscription-Key": self._api_key})
                         recv_task = asyncio.create_task(receiver(ws))
                     except Exception:
-                        # Connect failed â€” fall through with stream_failed=True.
-                        # We still keep reading frames below (buffering them
-                        # for the batch fallback) rather than bailing out, so
-                        # no audio is lost.
                         ws = None
                         stream_failed = True
 
                 buffered_frames.append(data)
+
+                # Resample to 16kHz for Sarvam STT WebSocket if needed
+                if data.sample_rate != 16000 or data.num_channels != 1:
+                    if resampler is None or current_sample_rate != data.sample_rate:
+                        if hasattr(rtc, "AudioResampler"):
+                            try:
+                                resampler = rtc.AudioResampler(
+                                    input_rate=data.sample_rate,
+                                    output_rate=16000,
+                                    num_channels=1,
+                                )
+                                current_sample_rate = data.sample_rate
+                            except Exception:
+                                resampler = None
+                    if resampler is not None:
+                        frames_to_send = resampler.push(data)
+                    else:
+                        frames_to_send = [data]
+                else:
+                    frames_to_send = [data]
+
                 if ws is not None and not stream_failed:
+                    for frame in frames_to_send:
+                        try:
+                            pcm_bytes = frame.data.tobytes()
+                            await ws.send_str(json.dumps({
+                                "audio": {
+                                    "data": base64.b64encode(pcm_bytes).decode("ascii"),
+                                    "sample_rate": "16000",
+                                    "encoding": "audio/pcm_s16le",
+                                }
+                            }))
+                        except Exception:
+                            stream_failed = True
+                            break
+
+            else:  # flush sentinel — end of this utterance
+                if not utterance_started:
+                    continue  # flush with no preceding audio — nothing to finalize
+
+                if resampler is not None and ws is not None and not stream_failed:
                     try:
-                        pcm_bytes = data.data.tobytes()
-                        await ws.send_str(json.dumps({
-                            "audio": {
-                                "data": base64.b64encode(pcm_bytes).decode("ascii"),
-                                "sample_rate": "16000",
-                                "encoding": "audio/pcm_s16le",
-                            }
-                        }))
+                        flushed_frames = resampler.flush()
+                        for frame in flushed_frames:
+                            pcm_bytes = frame.data.tobytes()
+                            await ws.send_str(json.dumps({
+                                "audio": {
+                                    "data": base64.b64encode(pcm_bytes).decode("ascii"),
+                                    "sample_rate": "16000",
+                                    "encoding": "audio/pcm_s16le",
+                                }
+                            }))
                     except Exception:
                         stream_failed = True
-
-            else:  # flush sentinel â€” end of this utterance
-                if not utterance_started:
-                    continue  # flush with no preceding audio â€” nothing to finalize
 
                 if ws is not None and not stream_failed:
                     try:

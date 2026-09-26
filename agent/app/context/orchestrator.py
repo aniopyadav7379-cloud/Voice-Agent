@@ -62,15 +62,16 @@ class ContextOrchestrator:
             and self._live_api is not None
         )
 
-        try:
-            bundle.fast_context = await self._moss.retrieve_context(
-                tenant_id=tenant_id,
-                logical_name="session_context",
-                query_text=query_text,
-            )
-            bundle.sources_queried.append("moss")
-        except MossUnavailableError:
-            bundle.degraded.append("moss")
+        if self._moss is not None:
+            try:
+                bundle.fast_context = await self._moss.retrieve_context(
+                    tenant_id=tenant_id,
+                    logical_name="session_context",
+                    query_text=query_text,
+                )
+                bundle.sources_queried.append("moss")
+            except Exception:
+                bundle.degraded.append("moss")
 
         tasks: dict[str, Any] = {}
 
